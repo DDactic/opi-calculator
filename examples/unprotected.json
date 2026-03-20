@@ -1,0 +1,24 @@
+{
+  "target": "startup.io",
+  "cdn_quality": "none",
+  "assets": [
+    {
+      "fqdn": "www.startup.io",
+      "cdn": false,
+      "waf": false,
+      "origin_hidden": false
+    },
+    {
+      "fqdn": "api.startup.io",
+      "cdn": false,
+      "waf": false,
+      "origin_hidden": false
+    },
+    {
+      "fqdn": "app.startup.io",
+      "cdn": false,
+      "waf": false,
+      "origin_hidden": false
+    }
+  ]
+}

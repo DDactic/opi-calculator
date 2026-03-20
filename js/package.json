@@ -1,0 +1,20 @@
+{
+  "name": "@ddactic/opi-calculator",
+  "version": "1.0.0",
+  "description": "Open Protection Index (OPI) - DDoS resilience scoring calculator",
+  "main": "opi-calculator.js",
+  "exports": {
+    ".": "./opi-calculator.js"
+  },
+  "keywords": ["ddos", "security", "resilience", "scoring", "opi", "protection"],
+  "author": "DDactic <opi@ddactic.net>",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ddactic/opi-calculator"
+  },
+  "homepage": "https://ddactic.net/opi",
+  "engines": {
+    "node": ">=16"
+  }
+}

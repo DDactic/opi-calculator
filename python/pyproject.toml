@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "opi-calculator"
+version = "1.0.0"
+description = "Open Protection Index (OPI) - DDoS resilience scoring calculator"
+readme = "../README.md"
+license = {text = "Apache-2.0"}
+requires-python = ">=3.10"
+authors = [{name = "DDactic", email = "opi@ddactic.net"}]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Topic :: Security",
+    "Programming Language :: Python :: 3",
+]
+
+[project.scripts]
+opi-calc = "opi_calculator.cli:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

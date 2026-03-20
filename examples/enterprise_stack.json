@@ -1,0 +1,38 @@
+{
+  "target": "enterprise-corp.com",
+  "cdn_quality": "enterprise",
+  "assets": [
+    {
+      "fqdn": "www.enterprise-corp.com",
+      "cdn": true,
+      "waf": true,
+      "origin_hidden": true,
+      "rate_limiting": true,
+      "vendor": "cloudflare",
+      "scrubbing": "radware"
+    },
+    {
+      "fqdn": "app.enterprise-corp.com",
+      "cdn": true,
+      "waf": true,
+      "origin_hidden": true,
+      "rate_limiting": true,
+      "vendor": "cloudflare"
+    },
+    {
+      "fqdn": "api.enterprise-corp.com",
+      "cdn": true,
+      "waf": true,
+      "origin_hidden": true,
+      "rate_limiting": true,
+      "vendor": "aws"
+    },
+    {
+      "fqdn": "portal.enterprise-corp.com",
+      "cdn": true,
+      "waf": true,
+      "origin_hidden": true,
+      "vendor": "cloudflare"
+    }
+  ]
+}

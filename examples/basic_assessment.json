@@ -1,0 +1,40 @@
+{
+  "target": "example.com",
+  "cdn_quality": "standard",
+  "assets": [
+    {
+      "fqdn": "www.example.com",
+      "cdn": true,
+      "waf": true,
+      "origin_hidden": true,
+      "rate_limiting": true,
+      "vendor": "cloudflare"
+    },
+    {
+      "fqdn": "app.example.com",
+      "cdn": true,
+      "waf": true,
+      "origin_hidden": true,
+      "vendor": "cloudflare"
+    },
+    {
+      "fqdn": "api.example.com",
+      "cdn": true,
+      "waf": false,
+      "origin_hidden": false,
+      "vendor": "cloudflare"
+    },
+    {
+      "fqdn": "mail.example.com",
+      "cdn": false,
+      "waf": false,
+      "origin_hidden": false
+    },
+    {
+      "fqdn": "staging.example.com",
+      "cdn": false,
+      "waf": false,
+      "origin_hidden": false
+    }
+  ]
+}
