@@ -1,7 +1,7 @@
 """
 OPI Calculator - Open Protection Index scoring engine.
 
-Implements the OPI v1.0.0 specification for measuring DDoS resilience.
+Implements the OPI v1.1.0 specification for measuring DDoS resilience.
 See: https://github.com/ddactic/opi-calculator
 
 Usage:
@@ -22,7 +22,7 @@ import math
 from typing import Any
 
 
-# OPI v1.0.0 component weights (Section 3.1)
+# OPI v1.1.0 component weights (Section 3.1)
 WEIGHTS = {
     "defense_coverage": 0.20,
     "l7_attack": 0.25,
@@ -218,6 +218,63 @@ def l7_resilience_score(
     base = {"enterprise": 80, "standard": 55, "basic": 40, "none": 10}.get(cdn_quality, 10)
     score = round(base * cov + 10 * (1 - cov))
     return {"score": score, "source": "estimated"}
+
+
+def l7_attack_surface_penalty(l7_findings: list[dict] | None = None) -> dict:
+    """
+    Calculate L7 DDoS-relevant penalty from passive reconnaissance (OPI Section 4.2.5).
+
+    These penalties reflect cache-bypass vectors, amplification potential, and
+    resource exhaustion paths that CDN/WAF cannot mitigate without explicit configuration.
+
+    Args:
+        l7_findings: List of finding dicts, each with a "finding_type" key.
+
+    Returns:
+        Dict with total penalty and per-finding breakdown.
+    """
+    if not l7_findings:
+        return {"penalty": 0, "applied": [], "source": "no_l7_data"}
+
+    from collections import Counter
+    counts = Counter(f.get("finding_type", "") for f in l7_findings if isinstance(f, dict))
+
+    penalty = 0
+    applied = []
+
+    # GraphQL introspection = complexity attacks bypass cache, expensive origin queries
+    if counts.get("graphql_introspection", 0) > 0:
+        penalty += 12
+        applied.append({"finding": "graphql_introspection", "penalty": 12, "reason": "Complexity attacks bypass cache"})
+    elif counts.get("graphql_endpoint", 0) > 5:
+        penalty += 8
+        applied.append({"finding": "graphql_endpoints_many", "penalty": 8, "count": counts["graphql_endpoint"], "reason": "Large uncacheable query surface"})
+    elif counts.get("graphql_endpoint", 0) > 0:
+        penalty += 4
+        applied.append({"finding": "graphql_endpoints", "penalty": 4, "count": counts["graphql_endpoint"], "reason": "Uncacheable query surface"})
+
+    # WordPress XMLRPC = pingback amplification (reflected DDoS)
+    if counts.get("wp_xmlrpc", 0) > 0:
+        penalty += 6
+        applied.append({"finding": "wp_xmlrpc", "penalty": 6, "reason": "Pingback amplification vector"})
+
+    # No rate limiting + login endpoints = unlimited auth request volume
+    has_rate_limit = counts.get("rate_limit_config", 0) > 0
+    login_count = counts.get("login_endpoint", 0) + counts.get("login_detected", 0)
+    if not has_rate_limit and login_count > 3:
+        penalty += 8
+        applied.append({"finding": "no_rate_limit_with_logins", "penalty": 8, "login_count": login_count, "reason": "Unlimited auth request volume"})
+
+    # Large uncacheable API surface = cache-bypass flood targets
+    api_count = counts.get("api_endpoint_discovered", 0) + counts.get("graphql_endpoint", 0)
+    if api_count > 20:
+        penalty += 6
+        applied.append({"finding": "large_api_surface", "penalty": 6, "api_count": api_count, "reason": "Many cache-bypass vectors"})
+    elif api_count > 5:
+        penalty += 3
+        applied.append({"finding": "api_surface", "penalty": 3, "api_count": api_count, "reason": "Some cache-bypass vectors"})
+
+    return {"penalty": penalty, "applied": applied, "source": "l7_recon"}
 
 
 def l3l4_resilience_score(
@@ -418,6 +475,7 @@ def calculate_opi(
     attack_results: dict | None = None,
     operational_measured: dict | None = None,
     evasion_measured: dict | None = None,
+    l7_findings: list[dict] | None = None,
 ) -> dict:
     """
     Calculate complete OPI score from asset inventory and optional test data.
@@ -433,6 +491,7 @@ def calculate_opi(
         attack_results: Dict of attack test results for L7/protocol scoring (optional)
         operational_measured: Operational test measurements (optional)
         evasion_measured: Evasion detection test results (optional)
+        l7_findings: List of L7 recon finding dicts for attack surface penalties (optional, v1.1)
 
     Returns:
         Dict with score, grade, classification, and per-component breakdown.
@@ -457,6 +516,13 @@ def calculate_opi(
         if l7_data:
             l7_attacks = l7_data
     l7 = l7_resilience_score(cdn_quality=cdn_quality, cdn_coverage=cdn_cov, attack_results=l7_attacks)
+
+    # L7 Attack Surface penalties (Section 4.2.5, v1.1)
+    # Applied only in Estimated tier (l7_findings present, no active test results)
+    l7_surface = l7_attack_surface_penalty(l7_findings)
+    if l7_surface["penalty"] > 0 and l7["source"] == "estimated":
+        l7["score"] = max(0, l7["score"] - l7_surface["penalty"])
+        l7["l7_surface_penalty"] = l7_surface
 
     # Component 3: L3/L4 Resilience
     l3l4 = l3l4_resilience_score(
@@ -501,10 +567,16 @@ def calculate_opi(
 
     g = grade_from_score(score)
 
+    # Determine assessment tier (Section 3.4)
+    has_active = attack_results or operational_measured or evasion_measured
+    has_l7_recon = l7_findings is not None and len(l7_findings) > 0
+    tier = "validated" if has_active else ("estimated" if has_l7_recon else "passive")
+
     return {
         "score": score,
         "grade": g["grade"],
         "classification": g["classification"],
+        "tier": tier,
         "components": {
             "defense_coverage": dc,
             "l7_attack": l7,
@@ -515,6 +587,7 @@ def calculate_opi(
         },
         "weights": WEIGHTS,
         "asset_count": len(assets),
+        "version": "1.1.0",
     }
 
 

@@ -13,7 +13,7 @@ OPI is a vendor-neutral, open standard for measuring how well a website or appli
 | Component | Weight | What It Measures |
 |-----------|--------|------------------|
 | Defense Coverage | 20% | CDN, WAF, origin protection, rate limiting, automation |
-| L7 Attack Resilience | 25% | HTTP floods, Slowloris, cache bypass, API abuse |
+| L7 Attack Resilience | 25% | HTTP floods, Slowloris, cache bypass, API abuse. v1.1: Penalized for exposed GraphQL, missing rate limiting, XMLRPC amplification, large API surface |
 | L3/L4 Resilience | 15% | SYN/UDP floods, scrubbing centers, pipeline capacity |
 | Protocol Resilience | 15% | HTTP/2 Rapid Reset, CONTINUATION Flood, QUIC attacks |
 | Operational Resilience | 15% | Availability, latency, false positive rate, recovery |

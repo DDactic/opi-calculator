@@ -1,7 +1,7 @@
 /**
  * OPI Calculator - Open Protection Index scoring engine (JavaScript)
  *
- * Implements the OPI v1.0.0 specification for measuring DDoS resilience.
+ * Implements the OPI v1.1.0 specification for measuring DDoS resilience.
  * See: https://github.com/ddactic/opi-calculator
  *
  * @example
@@ -18,7 +18,7 @@
  * console.log(`OPI: ${result.score}/100 (Grade ${result.grade})`);
  */
 
-// OPI v1.0.0 component weights (Section 3.1)
+// OPI v1.1.0 component weights (Section 3.1)
 const WEIGHTS = {
   defenseCoverage: 0.20,
   l7Attack: 0.25,
@@ -141,6 +141,36 @@ function l7ResilienceScore({ cdnQuality = 'none', cdnCoverage = 0, attackResults
   return { score: Math.round(base * cov + 10 * (1 - cov)), source: 'estimated' };
 }
 
+/**
+ * Calculate L7 DDoS-relevant penalty from passive recon findings (Section 4.2.5, v1.1).
+ * @param {Array} l7Findings - Array of {findingType: string} objects from L7 recon.
+ * @returns {{penalty: number, applied: Array, source: string}}
+ */
+function l7AttackSurfacePenalty(l7Findings) {
+  if (!l7Findings || l7Findings.length === 0) return { penalty: 0, applied: [], source: 'no_l7_data' };
+  const counts = {};
+  l7Findings.forEach(f => { const t = f.findingType || f.finding_type || ''; counts[t] = (counts[t] || 0) + 1; });
+
+  let penalty = 0;
+  const applied = [];
+
+  if (counts.graphql_introspection > 0) { penalty += 12; applied.push({ finding: 'graphql_introspection', penalty: 12 }); }
+  else if ((counts.graphql_endpoint || 0) > 5) { penalty += 8; applied.push({ finding: 'graphql_endpoints_many', penalty: 8 }); }
+  else if ((counts.graphql_endpoint || 0) > 0) { penalty += 4; applied.push({ finding: 'graphql_endpoints', penalty: 4 }); }
+
+  if (counts.wp_xmlrpc > 0) { penalty += 6; applied.push({ finding: 'wp_xmlrpc', penalty: 6 }); }
+
+  const hasRl = (counts.rate_limit_config || 0) > 0;
+  const loginCnt = (counts.login_endpoint || 0) + (counts.login_detected || 0);
+  if (!hasRl && loginCnt > 3) { penalty += 8; applied.push({ finding: 'no_rate_limit_with_logins', penalty: 8 }); }
+
+  const apiCnt = (counts.api_endpoint_discovered || 0) + (counts.graphql_endpoint || 0);
+  if (apiCnt > 20) { penalty += 6; applied.push({ finding: 'large_api_surface', penalty: 6 }); }
+  else if (apiCnt > 5) { penalty += 3; applied.push({ finding: 'api_surface', penalty: 3 }); }
+
+  return { penalty, applied, source: 'l7_recon' };
+}
+
 function l3l4ResilienceScore({
   cdnCoverage = 0, hasCdn = false, exposedOrigins = 0,
   scrubbingVendor = null, pipelineGbps = null, ispTier = null,
@@ -224,6 +254,7 @@ function evasionResistanceScore({ cdnQuality = 'none', cdnCoverage = 0, hasCdn =
 function calculateOPI({
   assets, cdnQuality = 'none',
   scrubbingVendor = null, pipelineGbps = null, ispTier = null,
+  l7Findings = null,
 } = {}) {
   const total = Math.max(assets.length, 1);
   const cdnCount = assets.filter(a => a.cdn).length;
@@ -234,6 +265,14 @@ function calculateOPI({
 
   const dc = defenseCoverageScore(assets);
   const l7 = l7ResilienceScore({ cdnQuality, cdnCoverage: cdnCov });
+
+  // L7 Attack Surface penalties (Section 4.2.5, v1.1)
+  const l7Surface = l7AttackSurfacePenalty(l7Findings);
+  if (l7Surface.penalty > 0 && l7.source === 'estimated') {
+    l7.score = Math.max(0, l7.score - l7Surface.penalty);
+    l7.l7SurfacePenalty = l7Surface;
+  }
+
   const l3l4 = l3l4ResilienceScore({
     cdnCoverage: cdnCov, hasCdn, exposedOrigins: exposed,
     scrubbingVendor, pipelineGbps, ispTier,
@@ -255,14 +294,20 @@ function calculateOPI({
 
   const { grade, classification } = gradeFromScore(score);
 
+  // Assessment tier (Section 3.4)
+  const hasL7Recon = l7Findings && l7Findings.length > 0;
+  const tier = 'passive'; // JS calculator is passive-only; active testing uses Python backend
+
   return {
     score, grade, classification,
+    tier: hasL7Recon ? 'estimated' : tier,
     components: {
       defenseCoverage: dc, l7Attack: l7, l3l4Attack: l3l4,
       protocol: proto, operational: ops, evasion,
     },
     weights: WEIGHTS,
     assetCount: assets.length,
+    version: '1.1.0',
   };
 }
 
@@ -278,7 +323,7 @@ function normalizedOPI(rawScore, fleetRps, fleetCount = 1) {
 // Node.js / CommonJS export
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = {
-    calculateOPI, defenseCoverageScore, l7ResilienceScore,
+    calculateOPI, defenseCoverageScore, l7ResilienceScore, l7AttackSurfacePenalty,
     l3l4ResilienceScore, protocolResilienceScore, operationalResilienceScore,
     evasionResistanceScore, gradeFromScore, normalizedOPI,
     WEIGHTS, GRADE_SCALE, VENDOR_AUTOMATION_TIERS, SCRUBBING_QUALITY,
