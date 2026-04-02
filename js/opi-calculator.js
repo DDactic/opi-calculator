@@ -1,8 +1,19 @@
 /**
  * OPI Calculator - Open Protection Index scoring engine (JavaScript)
  *
- * Implements the OPI v1.1.0 specification for measuring DDoS resilience.
+ * Implements the OPI v1.4.0 specification for measuring DDoS resilience.
  * See: https://github.com/ddactic/opi-calculator
+ *
+ * Changelog v1.4.0 (synced with backend compute_opi_scores):
+ *  - Config-aware WAF scoring via optional vendorConfigs parameter
+ *  - On-prem WAF vendor_class credits (ddos_appliance, security_waf, load_balancer, cloud_waf)
+ *  - On-prem L3/L4 stacking with cloud scrubbing and ISP tier
+ *  - ISP tier stacking bonuses (20% with scrubbing, 30% with on-prem)
+ *  - L7 base cap for security_waf-only (no CDN, no ddos_appliance)
+ *  - Scaling architecture bonus in operational resilience
+ *  - AI SLD exclusion for third-party asset filtering
+ *  - Hardening potential metric
+ *  - Origin leak via DNS penalty (-20 to origin protection)
  *
  * @example
  * const { calculateOPI } = require('./opi-calculator');
@@ -18,7 +29,7 @@
  * console.log(`OPI: ${result.score}/100 (Grade ${result.grade})`);
  */
 
-// OPI v1.1.0 component weights (Section 3.1)
+// OPI v1.4.0 component weights (Section 3.1)
 const WEIGHTS = {
   defenseCoverage: 0.20,
   l7Attack: 0.25,
@@ -52,6 +63,35 @@ const SCRUBBING_QUALITY = {
   akamai: 70, prolexic: 70, netscout: 65, arbor: 60, f5: 55,
 };
 
+// On-prem WAF vendor_class base credits (fraction of a full cloud WAF)
+const VENDOR_CLASS_WAF_CREDITS = {
+  cloud_waf: 1.0,
+  ddos_appliance: 0.7,
+  security_waf: 0.4,
+  load_balancer: 0.4,
+  unknown: 0.4,
+};
+
+// On-prem L3/L4 bonus by vendor_class
+const ONPREM_L3L4_BONUS = {
+  ddos_appliance: 45,
+  security_waf: 15,
+  load_balancer: 20,
+};
+
+// Scaling architecture scores
+const SCALING_SCORES = {
+  serverless: 8,
+  hpa_preloaded: 8,
+  hpa: 5,
+  keda: 5,
+  vm_pool: 3,
+  asg: 2,
+  vertical: 0,
+  manual: 0,
+  none: 0,
+};
+
 function gradeFromScore(score) {
   for (const [threshold, grade, classification] of GRADE_SCALE) {
     if (score >= threshold) return { grade, classification };
@@ -59,41 +99,135 @@ function gradeFromScore(score) {
   return { grade: 'F', classification: 'Critical' };
 }
 
-function defenseCoverageScore(assets) {
+/**
+ * Calculate defense coverage score.
+ *
+ * @param {Array} assets - Asset inventory. Each asset may include:
+ *   - cdn {boolean} CDN detected
+ *   - waf {boolean} WAF detected (cloud)
+ *   - rateLimiting {boolean} Rate-limit headers detected
+ *   - originHidden {boolean} Origin IP hidden behind CDN
+ *   - hasTunnel {boolean} Exposed via tunnel/ZTNA
+ *   - vendor {string} CDN/WAF vendor name
+ *   - scrubbing {string} Scrubbing vendor name
+ *   - vendorClass {string} On-prem class: 'ddos_appliance'|'security_waf'|'cloud_waf'|'load_balancer'|'unknown'
+ *   - onPrem {boolean} Whether this is an on-prem appliance
+ *   - applianceVendor {string} On-prem appliance vendor name (for config matching)
+ *   - originLeakedViaDns {boolean} MX/SPF records leak origin IP
+ * @param {Object} [vendorConfigs=null] - Optional vendor config map { vendorId: { waf_credit_multiplier, vendor_class_override } }
+ * @returns {Object} Defense coverage breakdown
+ */
+function defenseCoverageScore(assets, vendorConfigs = null) {
   const total = Math.max(assets.length, 1);
 
   const cdnCount = assets.filter(a => a.cdn).length;
   const cdn = Math.round((cdnCount / total) * 100);
 
-  const wafCount = assets.filter(a => a.waf).length;
+  // Separate cloud WAF assets from on-prem WAF assets
+  const cloudWafAssets = assets.filter(a => a.waf && !a.onPrem);
+  const onpremWafAssets = assets.filter(a => a.onPrem && !a.waf);
   const rlCount = assets.filter(a => a.rateLimiting).length;
-  const waf = wafCount > 0 ? Math.round((wafCount / total) * 100)
-    : rlCount > 0 ? 50 : 0;
+
+  // Config-aware WAF credit calculation
+  let waf;
+  if (cloudWafAssets.length > 0 || onpremWafAssets.length > 0) {
+    let effectiveWaf = 0.0;
+
+    // Cloud WAF assets: full credit, adjusted by config if available
+    for (const a of cloudWafAssets) {
+      const cdnVendor = (a.vendor || '').toLowerCase();
+      let configMultiplier = null;
+      if (vendorConfigs) {
+        for (const [vid, vc] of Object.entries(vendorConfigs)) {
+          if (cdnVendor.includes(vid) || vid.includes(cdnVendor)) {
+            configMultiplier = vc.waf_credit_multiplier != null ? vc.waf_credit_multiplier : 1.0;
+            break;
+          }
+        }
+      }
+      effectiveWaf += configMultiplier != null ? Math.min(1.0, 1.0 * configMultiplier) : 1.0;
+    }
+
+    // On-prem WAF assets: partial credit by vendor_class, adjusted by config
+    for (const a of onpremWafAssets) {
+      let vc = a.vendorClass || 'security_waf';
+      const appVendor = (a.applianceVendor || '').toLowerCase();
+      let configMultiplier = null;
+
+      if (vendorConfigs && appVendor) {
+        for (const [vid, vcfg] of Object.entries(vendorConfigs)) {
+          if (appVendor.includes(vid) || appVendor.startsWith(vid)) {
+            configMultiplier = vcfg.waf_credit_multiplier != null ? vcfg.waf_credit_multiplier : 1.0;
+            // Override vendor_class if config detected specific modules
+            if (vcfg.vendor_class_override) {
+              vc = vcfg.vendor_class_override;
+            }
+            break;
+          }
+        }
+      }
+
+      const baseCredit = VENDOR_CLASS_WAF_CREDITS[vc] || 0.4;
+      effectiveWaf += configMultiplier != null ? Math.min(1.0, baseCredit * configMultiplier) : baseCredit;
+    }
+
+    waf = Math.round((effectiveWaf / total) * 100);
+  } else if (rlCount > 0) {
+    // Fallback: legacy boolean waf field
+    const wafCount = assets.filter(a => a.waf).length;
+    if (wafCount > 0) {
+      waf = Math.round((wafCount / total) * 100);
+    } else {
+      waf = 50;
+    }
+  } else {
+    // Check legacy boolean waf for backward compat
+    const wafCount = assets.filter(a => a.waf).length;
+    waf = wafCount > 0 ? Math.round((wafCount / total) * 100) : 0;
+  }
 
   let exposed = 0;
   let tunnelCount = 0;
+  let originLeakedViaDns = false;
   for (const a of assets) {
     if (a.hasTunnel) { tunnelCount++; continue; }
     if (a.cdn && !a.originHidden) exposed++;
     else if (!a.cdn) exposed++;
+    if (a.originLeakedViaDns) originLeakedViaDns = true;
   }
-  const origin = Math.round((Math.max(0, cdnCount - exposed) / total) * 100);
+  let origin = Math.round((Math.max(0, cdnCount - exposed) / total) * 100);
+  // MX/SPF origin leak penalty (matches backend)
+  if (originLeakedViaDns) {
+    origin = Math.max(0, origin - 20);
+  }
+
   const rateLimit = Math.round((rlCount / total) * 100);
 
   // Protection automation
   const vendorScores = [];
   let hasScrubbing = false;
   let scrubbingQuality = 0;
+  const onpremApplianceNames = [];
+  let hasOnPremAppliance = false;
   for (const a of assets) {
     const vendor = (a.vendor || '').toLowerCase();
     const scrub = (a.scrubbing || '').toLowerCase();
+    const appVendor = (a.applianceVendor || '').toLowerCase();
+    const combined = `${vendor} ${scrub} ${appVendor}`;
     for (const [v, tier] of Object.entries(VENDOR_AUTOMATION_TIERS)) {
-      if (vendor.includes(v) || scrub.includes(v)) vendorScores.push(tier);
+      if (combined.includes(v)) vendorScores.push(tier);
     }
     for (const [sv, quality] of Object.entries(SCRUBBING_QUALITY)) {
       if (scrub.includes(sv)) {
         hasScrubbing = true;
         scrubbingQuality = Math.max(scrubbingQuality, quality);
+      }
+    }
+    if (a.onPrem) {
+      hasOnPremAppliance = true;
+      const name = a.applianceVendor || appVendor || 'Unknown';
+      if (name && !onpremApplianceNames.includes(name)) {
+        onpremApplianceNames.push(name);
       }
     }
   }
@@ -108,14 +242,34 @@ function defenseCoverageScore(assets) {
     cdn * 0.25 + waf * 0.25 + origin * 0.20 + rateLimit * 0.15 + automation * 0.15
   );
 
+  // Detect vendor_class flags for downstream use
+  const hasOnPremDdosAppliance = assets.some(a => a.vendorClass === 'ddos_appliance' && a.onPrem);
+  const hasOnPremSecurityWaf = assets.some(a => a.vendorClass === 'security_waf' && a.onPrem);
+  const hasOnPremLb = assets.some(a => a.vendorClass === 'load_balancer' && a.onPrem);
+  const vendorClassesDetected = [...new Set(assets.filter(a => a.vendorClass).map(a => a.vendorClass))];
+
   return {
     score, cdnDeployment: cdn, wafDeployment: waf,
     originProtection: origin, rateLimiting: rateLimit,
     protectionAutomation: automation, hasScrubbing, scrubbingQuality, tunnelAssets: tunnelCount,
+    hasOnPremAppliance, onpremApplianceNames,
+    hasOnPremDdosAppliance, hasOnPremSecurityWaf, hasOnPremLb,
+    vendorClassesDetected, originLeakedViaDns,
+    vendorScores, // exposed for hardeningPotential calculation
   };
 }
 
-function l7ResilienceScore({ cdnQuality = 'none', cdnCoverage = 0, attackResults = null } = {}) {
+/**
+ * Calculate L7 DDoS resilience score.
+ *
+ * @param {Object} options
+ * @param {string} [options.cdnQuality='none'] - CDN quality tier
+ * @param {number} [options.cdnCoverage=0] - CDN coverage ratio (0-1)
+ * @param {Object} [options.attackResults=null] - Measured attack results
+ * @param {boolean} [options.hasOnlySecurityWaf=false] - True if only security_waf present (no CDN, no ddos_appliance)
+ * @returns {Object}
+ */
+function l7ResilienceScore({ cdnQuality = 'none', cdnCoverage = 0, attackResults = null, hasOnlySecurityWaf = false } = {}) {
   if (attackResults) {
     const weights = {
       httpFlood: 0.30, slowloris: 0.20, resourceExhaustion: 0.20,
@@ -137,7 +291,14 @@ function l7ResilienceScore({ cdnQuality = 'none', cdnCoverage = 0, attackResults
 
   const cov = Math.max(0, Math.min(1, cdnCoverage));
   const baseMap = { enterprise: 80, standard: 55, basic: 40, none: 10 };
-  const base = baseMap[cdnQuality] || 10;
+  let base = baseMap[cdnQuality] || 10;
+
+  // Security WAFs collapse under L7 flood (DPI engine saturates CPU shared with IPS/AV).
+  // If only a security_waf is present (no CDN, no DDoS appliance), cap L7 score.
+  if (hasOnlySecurityWaf) {
+    base = Math.min(base, 25);
+  }
+
   return { score: Math.round(base * cov + 10 * (1 - cov)), source: 'estimated' };
 }
 
@@ -171,9 +332,24 @@ function l7AttackSurfacePenalty(l7Findings) {
   return { penalty, applied, source: 'l7_recon' };
 }
 
+/**
+ * Calculate L3/L4 DDoS resilience score.
+ *
+ * @param {Object} options
+ * @param {number} [options.cdnCoverage=0] - CDN coverage ratio (0-1)
+ * @param {boolean} [options.hasCdn=false] - Whether CDN is present
+ * @param {number} [options.exposedOrigins=0] - Number of exposed origin IPs
+ * @param {string} [options.scrubbingVendor=null] - Scrubbing vendor name
+ * @param {number} [options.pipelineGbps=null] - Upstream link capacity in Gbps
+ * @param {string} [options.ispTier=null] - ISP DDoS protection tier ('basic'|'standard'|'premium'|'enterprise')
+ * @param {string} [options.onPremVendorClass=null] - On-prem vendor class ('ddos_appliance'|'security_waf'|'load_balancer')
+ * @param {boolean} [options.hasOnPremAppliance=false] - Whether on-prem appliance is present
+ * @returns {Object}
+ */
 function l3l4ResilienceScore({
   cdnCoverage = 0, hasCdn = false, exposedOrigins = 0,
   scrubbingVendor = null, pipelineGbps = null, ispTier = null,
+  onPremVendorClass = null, hasOnPremAppliance = false,
 } = {}) {
   const cov = Math.max(0, Math.min(1, cdnCoverage));
   let hasScrubbing = false, scrubbingQuality = 0;
@@ -196,13 +372,30 @@ function l3l4ResilienceScore({
 
   const ispScores = { none: 0, basic: 25, standard: 40, premium: 55, enterprise: 70 };
   const ispScore = ispTier ? (ispScores[ispTier.toLowerCase()] || 0) : 0;
+  const ispKnown = ispScore > 0;
+
+  // On-prem L3/L4 bonus by vendor_class
+  let onpremBonus = 0;
+  if (onPremVendorClass) {
+    onpremBonus = ONPREM_L3L4_BONUS[onPremVendorClass] || 0;
+  }
 
   let base;
   if (hasScrubbing) {
     base = scrubbingQuality - (exposedOrigins > 0 ? 15 : 0);
-    if (ispScore > 0) base = Math.min(100, base + Math.round(ispScore * 0.2));
+    // ISP tier stacks with cloud scrubbing: add 20% of ISP score
+    if (ispKnown) base = Math.min(100, base + Math.round(ispScore * 0.2));
+    // On-prem appliance stacks with cloud scrubbing: add 10%
+    if (onpremBonus > 0) base = Math.min(100, base + Math.round(onpremBonus * 0.1));
     if (pipelineBase !== null && pipelineBase < base) base = Math.round((base + pipelineBase) / 2);
-  } else if (ispScore > 0) {
+  } else if (hasOnPremAppliance && onpremBonus > 0) {
+    // No cloud scrubbing, but on-prem appliance provides inline protection.
+    // Limited by upstream link capacity.
+    base = onpremBonus - (exposedOrigins > 0 ? 10 : 0);
+    // ISP stacks with on-prem at 30%
+    if (ispKnown) base = Math.min(100, base + Math.round(ispScore * 0.3));
+    if (pipelineBase !== null && pipelineBase < base) base = Math.round((base + pipelineBase) / 2);
+  } else if (ispKnown) {
     base = ispScore - (exposedOrigins > 0 ? 10 : 0);
     if (pipelineBase !== null && pipelineBase < base) base = Math.round((base + pipelineBase) / 2);
   } else if (pipelineBase !== null) {
@@ -213,7 +406,7 @@ function l3l4ResilienceScore({
 
   base = Math.max(20, base);
   const score = hasCdn ? Math.round(base * cov + 20 * (1 - cov)) : base;
-  return { score, source: 'estimated', hasScrubbing, scrubbingQuality };
+  return { score, source: 'estimated', hasScrubbing, scrubbingQuality, onpremL3l4Bonus: onpremBonus };
 }
 
 function protocolResilienceScore({ cdnQuality = 'none', cdnCoverage = 0, hasCdn = false } = {}) {
@@ -223,13 +416,63 @@ function protocolResilienceScore({ cdnQuality = 'none', cdnCoverage = 0, hasCdn 
   return { score, source: 'estimated' };
 }
 
-function operationalResilienceScore({ cdnQuality = 'none', cdnCoverage = 0, cdnScore = 0, hasCdn = false } = {}) {
+/**
+ * Calculate operational resilience score.
+ *
+ * @param {Object} options
+ * @param {string} [options.cdnQuality='none'] - CDN quality tier
+ * @param {number} [options.cdnCoverage=0] - CDN coverage ratio (0-1)
+ * @param {number} [options.cdnScore=0] - CDN deployment score
+ * @param {boolean} [options.hasCdn=false] - Whether CDN is present
+ * @param {string} [options.scalingArchitecture=null] - Scaling type: 'serverless'|'hpa_preloaded'|'hpa'|'keda'|'vm_pool'|'asg'|'vertical'|'manual'|'none'
+ * @param {Array} [options.assets=null] - Assets for passive infra signal detection
+ * @param {boolean} [options.hasOnPremLb=false] - On-prem load balancer detected
+ * @returns {Object}
+ */
+function operationalResilienceScore({
+  cdnQuality = 'none', cdnCoverage = 0, cdnScore = 0, hasCdn = false,
+  scalingArchitecture = null, assets = null, hasOnPremLb = false,
+} = {}) {
   const cov = Math.max(0, Math.min(1, cdnCoverage));
   let score;
   if (cdnScore > 80) score = Math.round(75 * cov + 30 * (1 - cov));
   else if (hasCdn) score = Math.round(50 * cov + 30 * (1 - cov));
   else score = 30;
-  return { score, source: 'estimated' };
+
+  // Scaling architecture bonus
+  let scalingBonus = 0;
+  let detectedScalingArch = null;
+
+  if (scalingArchitecture) {
+    const sa = scalingArchitecture.toLowerCase();
+    scalingBonus = SCALING_SCORES[sa] != null ? SCALING_SCORES[sa] : 0;
+    detectedScalingArch = sa;
+  }
+
+  // Passive detection: Kubernetes headers or service mesh signals
+  if (scalingBonus === 0 && assets) {
+    for (const a of assets) {
+      const infra = Array.isArray(a.infraSignals) ? a.infraSignals : [];
+      if (infra.includes('kubernetes')) {
+        scalingBonus = Math.max(scalingBonus, 5);
+        detectedScalingArch = detectedScalingArch || 'hpa';
+      }
+      if (infra.includes('service_mesh')) {
+        scalingBonus = Math.max(scalingBonus, 3);
+        detectedScalingArch = detectedScalingArch || 'vm_pool';
+      }
+    }
+  }
+
+  // On-prem LB implies some load distribution
+  if (scalingBonus === 0 && hasOnPremLb) {
+    scalingBonus = 2;
+    detectedScalingArch = detectedScalingArch || 'asg';
+  }
+
+  score = Math.min(100, score + scalingBonus);
+
+  return { score, source: 'estimated', scalingBonus, scalingArchitecture: detectedScalingArch };
 }
 
 function evasionResistanceScore({ cdnQuality = 'none', cdnCoverage = 0, hasCdn = false } = {}) {
@@ -242,29 +485,87 @@ function evasionResistanceScore({ cdnQuality = 'none', cdnCoverage = 0, hasCdn =
 }
 
 /**
+ * Calculate hardening potential metric.
+ * Answers: "what % of DDactic's hardening actions can execute automatically
+ * (vs. guided or manual) given the customer's detected vendor stack?"
+ *
+ * @param {Array<number>} vendorScores - Array of vendor automation tier scores
+ * @returns {number} Hardening potential (0-100)
+ */
+function hardeningPotential(vendorScores) {
+  if (!vendorScores || vendorScores.length === 0) return 0;
+  const fullAuto = vendorScores.filter(s => s === 100).length;
+  const partialAuto = vendorScores.filter(s => s > 20 && s < 100).length;
+  const manualOnly = vendorScores.filter(s => s <= 20).length;
+  const totalVendors = Math.max(vendorScores.length, 1);
+  return Math.round((fullAuto * 100 + partialAuto * 60 + manualOnly * 20) / totalVendors);
+}
+
+/**
  * Calculate complete OPI score.
+ *
  * @param {Object} options
- * @param {Array} options.assets - Asset inventory
+ * @param {Array} options.assets - Asset inventory. Each asset may include:
+ *   - fqdn {string} Fully qualified domain name
+ *   - cdn {boolean} CDN detected
+ *   - waf {boolean} WAF detected (cloud)
+ *   - rateLimiting {boolean} Rate-limit headers detected
+ *   - originHidden {boolean} Origin IP hidden behind CDN
+ *   - hasTunnel {boolean} Exposed via tunnel/ZTNA
+ *   - vendor {string} CDN/WAF vendor name
+ *   - scrubbing {string} Scrubbing vendor name
+ *   - vendorClass {string} 'ddos_appliance'|'security_waf'|'cloud_waf'|'load_balancer'|'unknown'
+ *   - onPrem {boolean} Whether this is an on-prem appliance
+ *   - applianceVendor {string} On-prem appliance vendor name
+ *   - originLeakedViaDns {boolean} MX/SPF origin IP leak
+ *   - infraSignals {Array<string>} Infrastructure signals (e.g. 'kubernetes', 'service_mesh')
  * @param {string} [options.cdnQuality='none'] - CDN quality tier
  * @param {string} [options.scrubbingVendor] - Scrubbing vendor name
  * @param {number} [options.pipelineGbps] - Upstream link capacity
  * @param {string} [options.ispTier] - ISP DDoS protection tier
- * @returns {Object} OPI result with score, grade, and component breakdown
+ * @param {Array} [options.l7Findings=null] - L7 recon findings for attack surface penalty
+ * @param {Object} [options.vendorConfigs=null] - Vendor config map for config-aware WAF scoring
+ * @param {Array<string>} [options.excludedSlds=null] - SLDs to exclude from scoring (AI-flagged third-party)
+ * @param {string} [options.scalingArchitecture=null] - Scaling architecture type
+ * @returns {Object} OPI result with score, grade, component breakdown, and hardening potential
  */
 function calculateOPI({
   assets, cdnQuality = 'none',
   scrubbingVendor = null, pipelineGbps = null, ispTier = null,
-  l7Findings = null,
+  l7Findings = null, vendorConfigs = null, excludedSlds = null,
+  scalingArchitecture = null,
 } = {}) {
-  const total = Math.max(assets.length, 1);
-  const cdnCount = assets.filter(a => a.cdn).length;
+  // AI SLD exclusion: filter out assets belonging to excluded SLDs
+  let filteredAssets = assets;
+  if (excludedSlds && excludedSlds.length > 0) {
+    filteredAssets = assets.filter(a => {
+      const fqdn = a.fqdn || '';
+      return !excludedSlds.some(sld => fqdn.endsWith('.' + sld) || fqdn === sld);
+    });
+  }
+
+  const total = Math.max(filteredAssets.length, 1);
+  const cdnCount = filteredAssets.filter(a => a.cdn).length;
   const cdnCov = cdnCount / total;
   const hasCdn = cdnQuality !== 'none' || cdnCount > 0;
-  const exposed = assets.filter(a => a.cdn && !a.originHidden).length
-    + assets.filter(a => !a.cdn && !a.hasTunnel).length;
+  const exposed = filteredAssets.filter(a => a.cdn && !a.originHidden).length
+    + filteredAssets.filter(a => !a.cdn && !a.hasTunnel).length;
 
-  const dc = defenseCoverageScore(assets);
-  const l7 = l7ResilienceScore({ cdnQuality, cdnCoverage: cdnCov });
+  const dc = defenseCoverageScore(filteredAssets, vendorConfigs);
+
+  // Pre-compute vendor_class flags for L7 and L3/L4
+  const hasOnPremDdosAppliance = filteredAssets.some(a => a.vendorClass === 'ddos_appliance' && a.onPrem);
+  const hasOnPremSecurityWaf = filteredAssets.some(a => a.vendorClass === 'security_waf' && a.onPrem);
+  const hasOnPremLb = filteredAssets.some(a => a.vendorClass === 'load_balancer' && a.onPrem);
+  const hasOnlySecurityWaf = hasOnPremSecurityWaf && !hasOnPremDdosAppliance && !hasCdn;
+
+  // Determine on-prem vendor class for L3/L4 (pick highest priority)
+  let onPremVendorClass = null;
+  if (hasOnPremDdosAppliance) onPremVendorClass = 'ddos_appliance';
+  else if (hasOnPremSecurityWaf) onPremVendorClass = 'security_waf';
+  else if (hasOnPremLb) onPremVendorClass = 'load_balancer';
+
+  const l7 = l7ResilienceScore({ cdnQuality, cdnCoverage: cdnCov, hasOnlySecurityWaf });
 
   // L7 Attack Surface penalties (Section 4.2.5, v1.1)
   const l7Surface = l7AttackSurfacePenalty(l7Findings);
@@ -276,10 +577,12 @@ function calculateOPI({
   const l3l4 = l3l4ResilienceScore({
     cdnCoverage: cdnCov, hasCdn, exposedOrigins: exposed,
     scrubbingVendor, pipelineGbps, ispTier,
+    onPremVendorClass, hasOnPremAppliance: dc.hasOnPremAppliance,
   });
   const proto = protocolResilienceScore({ cdnQuality, cdnCoverage: cdnCov, hasCdn });
   const ops = operationalResilienceScore({
     cdnQuality, cdnCoverage: cdnCov, cdnScore: dc.cdnDeployment, hasCdn,
+    scalingArchitecture, assets: filteredAssets, hasOnPremLb,
   });
   const evasion = evasionResistanceScore({ cdnQuality, cdnCoverage: cdnCov, hasCdn });
 
@@ -298,6 +601,9 @@ function calculateOPI({
   const hasL7Recon = l7Findings && l7Findings.length > 0;
   const tier = 'passive'; // JS calculator is passive-only; active testing uses Python backend
 
+  // Hardening potential from detected vendor scores
+  const hp = hardeningPotential(dc.vendorScores);
+
   return {
     score, grade, classification,
     tier: hasL7Recon ? 'estimated' : tier,
@@ -306,8 +612,10 @@ function calculateOPI({
       protocol: proto, operational: ops, evasion,
     },
     weights: WEIGHTS,
-    assetCount: assets.length,
-    version: '1.1.0',
+    assetCount: filteredAssets.length,
+    excludedAssetCount: assets.length - filteredAssets.length,
+    hardeningPotential: hp,
+    version: '1.4.0',
   };
 }
 
@@ -325,15 +633,16 @@ if (typeof module !== 'undefined' && module.exports) {
   module.exports = {
     calculateOPI, defenseCoverageScore, l7ResilienceScore, l7AttackSurfacePenalty,
     l3l4ResilienceScore, protocolResilienceScore, operationalResilienceScore,
-    evasionResistanceScore, gradeFromScore, normalizedOPI,
+    evasionResistanceScore, gradeFromScore, normalizedOPI, hardeningPotential,
     WEIGHTS, GRADE_SCALE, VENDOR_AUTOMATION_TIERS, SCRUBBING_QUALITY,
+    VENDOR_CLASS_WAF_CREDITS, ONPREM_L3L4_BONUS, SCALING_SCORES,
   };
 }
 
 // ESM / browser export
 if (typeof globalThis !== 'undefined') {
   globalThis.OPICalculator = {
-    calculateOPI, defenseCoverageScore, gradeFromScore, normalizedOPI,
+    calculateOPI, defenseCoverageScore, gradeFromScore, normalizedOPI, hardeningPotential,
     WEIGHTS, GRADE_SCALE,
   };
 }
