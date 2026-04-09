@@ -143,7 +143,8 @@ class TestL3L4Resilience:
 class TestEvasionResistance:
     def test_no_protection(self):
         result = evasion_resistance_score(cdn_quality="none")
-        assert result["score"] == 10
+        # No CDN, no vendor data: capped at min(avg_depth=30, 30)
+        assert result["score"] == 30
 
     def test_measured_full_detection(self):
         result = evasion_resistance_score(measured={
@@ -174,13 +175,16 @@ class TestCalculateOPI:
     def test_enterprise(self):
         assets = [
             {"fqdn": "a.com", "cdn": True, "waf": True, "origin_hidden": True,
-             "rate_limiting": True, "vendor": "cloudflare"},
+             "rate_limiting": True, "vendor": "cloudflare",
+             "cdn_provider": "cloudflare"},
             {"fqdn": "b.com", "cdn": True, "waf": True, "origin_hidden": True,
-             "rate_limiting": True, "vendor": "cloudflare"},
+             "rate_limiting": True, "vendor": "cloudflare",
+             "cdn_provider": "cloudflare"},
         ]
         result = calculate_opi(assets, "enterprise")
-        assert result["grade"] in ("A", "B")
-        assert result["score"] >= 75
+        # Cloudflare bot detection depth = 50, enterprise CDN
+        assert result["grade"] in ("B", "C")
+        assert result["score"] >= 65
 
     def test_components_present(self):
         assets = [{"fqdn": "a.com", "cdn": True, "waf": True, "origin_hidden": True}]

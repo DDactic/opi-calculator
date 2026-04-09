@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name="opi-calculator",
-    version="1.0.0",
+    version="1.2.0",
     description="Open Protection Index (OPI) - DDoS resilience scoring calculator",
     long_description=open("../README.md").read(),
     long_description_content_type="text/markdown",

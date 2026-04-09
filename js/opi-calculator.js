@@ -475,12 +475,47 @@ function operationalResilienceScore({
   return { score, source: 'estimated', scalingBonus, scalingArchitecture: detectedScalingArch };
 }
 
-function evasionResistanceScore({ cdnQuality = 'none', cdnCoverage = 0, hasCdn = false } = {}) {
+// Bot detection depth scores from empirical JS RE (2026-04-03).
+// Higher = vendor JS fingerprints visitors more aggressively = harder to bypass.
+const VENDOR_BOT_DETECTION_DEPTH = {
+  f5: 95, 'f5 shape': 95, shape: 95,
+  vercara: 90, neustar: 90,
+  akamai: 85, perimeterx: 85, human: 85,
+  sucuri: 80, 'ddos-guard': 80, 'ddos guard': 80,
+  imperva: 78, incapsula: 78,
+  kasada: 75, datadome: 70,
+  radware: 65, fortinet: 60, fortiweb: 60,
+  aws: 55, cloudfront: 55, checkpoint: 55, 'check point': 55,
+  google: 50, gcp: 50, 'cloud armor': 50, cloudflare: 50,
+  fastly: 45, 'signal sciences': 45, gcore: 45,
+  lumen: 40, centurylink: 40,
+  citrix: 35, netscaler: 35,
+  azure: 20, microsoft: 20,
+};
+
+function evasionResistanceScore({ cdnQuality = 'none', cdnCoverage = 0, hasCdn = false, assets = null } = {}) {
   const cov = Math.max(0, Math.min(1, cdnCoverage));
+
+  // Compute average bot detection depth from detected vendors
+  const depths = [];
+  for (const a of (assets || [])) {
+    for (const field of ['wafProvider', 'cdnProvider', 'applianceVendor',
+                          'waf_provider', 'cdn_provider', 'appliance_vendor']) {
+      const v = (a[field] || '').toLowerCase();
+      if (!v) continue;
+      for (const [bv, bd] of Object.entries(VENDOR_BOT_DETECTION_DEPTH)) {
+        if (v.includes(bv)) {
+          depths.push(bd);
+          break;
+        }
+      }
+    }
+  }
+  const avgDepth = depths.length > 0 ? Math.round(depths.reduce((s, d) => s + d, 0) / depths.length) : 30;
+
   let score;
-  if (cdnQuality === 'enterprise') score = 60;
-  else if (hasCdn) score = Math.round(30 * cov + 10 * (1 - cov));
-  else score = 10;
+  if (hasCdn) score = Math.round(avgDepth * cov + 10 * (1 - cov));
+  else score = Math.min(avgDepth, 30);
   return { score, source: 'estimated' };
 }
 
@@ -584,7 +619,7 @@ function calculateOPI({
     cdnQuality, cdnCoverage: cdnCov, cdnScore: dc.cdnDeployment, hasCdn,
     scalingArchitecture, assets: filteredAssets, hasOnPremLb,
   });
-  const evasion = evasionResistanceScore({ cdnQuality, cdnCoverage: cdnCov, hasCdn });
+  const evasion = evasionResistanceScore({ cdnQuality, cdnCoverage: cdnCov, hasCdn, assets });
 
   const score = Math.round(
     dc.score * WEIGHTS.defenseCoverage +

@@ -432,16 +432,37 @@ def operational_resilience_score(
     return {"score": score, "source": "estimated"}
 
 
+# Bot detection depth scores from empirical JS RE (2026-04-03).
+# Higher = vendor JS fingerprints visitors more aggressively = harder to bypass.
+_VENDOR_BOT_DETECTION_DEPTH = {
+    "f5": 95, "f5 shape": 95, "shape": 95,
+    "vercara": 90, "neustar": 90,
+    "akamai": 85, "perimeterx": 85, "human": 85,
+    "sucuri": 80, "ddos-guard": 80, "ddos guard": 80,
+    "imperva": 78, "incapsula": 78,
+    "kasada": 75, "datadome": 70,
+    "radware": 65, "fortinet": 60, "fortiweb": 60,
+    "aws": 55, "cloudfront": 55, "checkpoint": 55, "check point": 55,
+    "google": 50, "gcp": 50, "cloud armor": 50, "cloudflare": 50,
+    "fastly": 45, "signal sciences": 45, "gcore": 45,
+    "lumen": 40, "centurylink": 40,
+    "citrix": 35, "netscaler": 35,
+    "azure": 20, "microsoft": 20,
+}
+
+
 def evasion_resistance_score(
     *,
     cdn_quality: str = "none",
     cdn_coverage: float = 0.0,
     has_cdn: bool = False,
     measured: dict | None = None,
+    assets: list | None = None,
 ) -> dict:
     """
     Calculate Evasion Resistance score (OPI Section 4.6).
 
+    In estimated mode, uses vendor bot detection depth from JS RE data.
     In measured mode, pass booleans for each detection capability:
         {"ja3_detected": True, "ua_detected": True, "slow_detected": False,
          "ip_rotation_handled": True, "header_detected": False}
@@ -456,12 +477,24 @@ def evasion_resistance_score(
         return {"score": score, "source": "measured"}
 
     cov = max(0.0, min(1.0, cdn_coverage))
-    if cdn_quality == "enterprise":
-        score = 60
-    elif has_cdn:
-        score = round(30 * cov + 10 * (1 - cov))
+
+    # Compute average bot detection depth from detected vendors
+    depths = []
+    for a in (assets or []):
+        for field in ("waf_provider", "cdn_provider", "appliance_vendor"):
+            v = (a.get(field) or "").lower()
+            if not v:
+                continue
+            for bv, bd in _VENDOR_BOT_DETECTION_DEPTH.items():
+                if bv in v:
+                    depths.append(bd)
+                    break
+    avg_depth = round(sum(depths) / max(len(depths), 1)) if depths else 30
+
+    if has_cdn:
+        score = round(avg_depth * cov + 10 * (1 - cov))
     else:
-        score = 10
+        score = min(avg_depth, 30)
     return {"score": score, "source": "estimated"}
 
 

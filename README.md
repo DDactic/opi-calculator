@@ -166,6 +166,22 @@ The calculator scores vendor automation capability - how programmable the protec
 | Guided REST | 60 | Fastly, Imperva, Gcore, Sucuri |
 | CLI/Manual | 20 | Akamai Prolexic, F5 |
 
+### Vendor Bot Detection Depth (v1.2.0)
+
+Evasion Resistance now uses empirical bot detection depth scores derived from JavaScript reverse engineering of vendor challenge pages. Higher scores mean the vendor fingerprints visitors more aggressively, making automated attacks harder to execute.
+
+| Depth | Vendors |
+|-------|---------|
+| 95 | F5 / Shape |
+| 85-90 | Akamai, PerimeterX / HUMAN, Vercara / Neustar |
+| 75-80 | Imperva / Incapsula, Sucuri, DDoS-Guard, Kasada |
+| 65-70 | Radware, DataDome |
+| 50-60 | Cloudflare, AWS / CloudFront, Fortinet, Check Point, GCP / Cloud Armor |
+| 35-45 | Fastly, Signal Sciences, Gcore, Lumen, Citrix / NetScaler |
+| 20 | Azure / Microsoft |
+
+When asset data includes `cdn_provider`, `waf_provider`, or `appliance_vendor` fields, the calculator automatically looks up the vendor's bot detection depth and uses it for evasion scoring instead of the previous static tiers.
+
 ## Measured Mode
 
 When you have actual attack test results, pass them for precise scoring instead of estimation:
