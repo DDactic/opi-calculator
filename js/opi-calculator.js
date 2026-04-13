@@ -59,7 +59,8 @@ const VENDOR_AUTOMATION_TIERS = {
 
 // Scrubbing center quality tiers
 const SCRUBBING_QUALITY = {
-  radware: 90, imperva: 75, incapsula: 75, neustar: 72,
+  cloudflare: 95, radware: 90, aws: 85, shield: 85,
+  imperva: 75, incapsula: 75, neustar: 72, vercara: 72,
   akamai: 70, prolexic: 70, netscout: 65, arbor: 60, f5: 55,
 };
 
