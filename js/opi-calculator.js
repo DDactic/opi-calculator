@@ -4,6 +4,16 @@
  * Implements the OPI v1.4.0 specification for measuring DDoS resilience.
  * See: https://github.com/ddactic/opi-calculator
  *
+ * Changelog v1.5.0:
+ *  - Rate limit counting architecture penalty (Section 4.2.6):
+ *    CDN vendors that use per-PoP/per-edge/per-server counting are bypasable via
+ *    geographic IP distribution even when rate limiting IS configured. Penalties
+ *    applied when rate limiting is detected AND a cloud CDN vendor is identified.
+ *    Azure Front Door (per-server, -8), Cloudflare/Akamai/GCP (per-PoP/region, -5),
+ *    Imperva (-4), Fastly/CloudFront/AWS WAF (hybrid/propagation-delay, -3).
+ *    Centralized vendors (Radware, Arbor, Netscout): no penalty.
+ *    Source: DDactic CDN_RATE_LIMIT_COUNTING_RESEARCH.md
+ *
  * Changelog v1.4.0 (synced with backend compute_opi_scores):
  *  - Config-aware WAF scoring via optional vendorConfigs parameter
  *  - On-prem WAF vendor_class credits (ddos_appliance, security_waf, load_balancer, cloud_waf)
@@ -62,6 +72,24 @@ const SCRUBBING_QUALITY = {
   cloudflare: 95, radware: 90, aws: 85, shield: 85,
   imperva: 75, incapsula: 75, neustar: 72, vercara: 72,
   akamai: 70, prolexic: 70, netscout: 65, arbor: 60, f5: 55,
+};
+
+// Rate limit counting architecture penalty (Section 4.2.6, v1.5)
+// Penalty applied when rate limiting IS present but the vendor's counting architecture
+// is per-PoP/per-edge/per-server — bypasable via geographic IP distribution.
+// Keyed by substring match against the lowercased cdn_provider / vendor field.
+// Centralized vendors (radware, arbor, netscout) are absent = 0 penalty.
+const RL_COUNTING_ARCH_PENALTY = {
+  'azure front door': 8,  // per-server: same client hits different servers via LB, loosest granularity
+  'cloudflare':       5,  // per-PoP: independent counters per DC, bypasable with geographic fleet
+  'akamai':           5,  // per-edge: 1-3s sync delay, burst-within-window bypass
+  'imperva':          4,  // per-PoP (undocumented sync, assumed same class as Cloudflare)
+  'incapsula':        4,
+  'google cloud cdn': 5,  // per-region: N deployment regions = N × configured threshold
+  'gcp':              5,
+  'fastly':           3,  // hybrid local+global (30s aggregation, effective threshold ~2×)
+  'cloudfront':       3,  // global but ~30s propagation delay before enforcement
+  'aws':              3,  // same as CloudFront
 };
 
 // On-prem WAF vendor_class base credits (fraction of a full cloud WAF)
@@ -304,11 +332,12 @@ function l7ResilienceScore({ cdnQuality = 'none', cdnCoverage = 0, attackResults
 }
 
 /**
- * Calculate L7 DDoS-relevant penalty from passive recon findings (Section 4.2.5, v1.1).
+ * Calculate L7 DDoS-relevant penalty from passive recon findings (Section 4.2.5-4.2.6, v1.1/v1.5).
  * @param {Array} l7Findings - Array of {findingType: string} objects from L7 recon.
+ * @param {string} [cdnVendor=null] - Detected CDN/WAF vendor name for counting-arch penalty.
  * @returns {{penalty: number, applied: Array, source: string}}
  */
-function l7AttackSurfacePenalty(l7Findings) {
+function l7AttackSurfacePenalty(l7Findings, cdnVendor = null) {
   if (!l7Findings || l7Findings.length === 0) return { penalty: 0, applied: [], source: 'no_l7_data' };
   const counts = {};
   l7Findings.forEach(f => { const t = f.findingType || f.finding_type || ''; counts[t] = (counts[t] || 0) + 1; });
@@ -325,6 +354,20 @@ function l7AttackSurfacePenalty(l7Findings) {
   const hasRl = (counts.rate_limit_config || 0) > 0;
   const loginCnt = (counts.login_endpoint || 0) + (counts.login_detected || 0);
   if (!hasRl && loginCnt > 3) { penalty += 8; applied.push({ finding: 'no_rate_limit_with_logins', penalty: 8 }); }
+
+  // Section 4.2.6 (v1.5): rate limit counting architecture gap.
+  // Rate limiting IS configured but the CDN enforces it per-PoP/per-server/per-region,
+  // making it bypasable via geographic IP distribution even within the stated threshold.
+  if (hasRl && cdnVendor) {
+    const v = cdnVendor.toLowerCase();
+    for (const [key, p] of Object.entries(RL_COUNTING_ARCH_PENALTY)) {
+      if (v.includes(key)) {
+        penalty += p;
+        applied.push({ finding: 'rate_limit_counting_arch_gap', vendor: cdnVendor, penalty: p });
+        break;
+      }
+    }
+  }
 
   const apiCnt = (counts.api_endpoint_discovered || 0) + (counts.graphql_endpoint || 0);
   if (apiCnt > 20) { penalty += 6; applied.push({ finding: 'large_api_surface', penalty: 6 }); }
@@ -603,8 +646,12 @@ function calculateOPI({
 
   const l7 = l7ResilienceScore({ cdnQuality, cdnCoverage: cdnCov, hasOnlySecurityWaf });
 
-  // L7 Attack Surface penalties (Section 4.2.5, v1.1)
-  const l7Surface = l7AttackSurfacePenalty(l7Findings);
+  // Detect dominant CDN vendor from asset list for counting-arch penalty (Section 4.2.6)
+  const vendorStrings = filteredAssets.map(a => (a.vendor || '').toLowerCase()).filter(Boolean);
+  const dominantVendor = vendorStrings.length > 0 ? vendorStrings[0] : null;
+
+  // L7 Attack Surface penalties (Section 4.2.5-4.2.6, v1.1/v1.5)
+  const l7Surface = l7AttackSurfacePenalty(l7Findings, dominantVendor);
   if (l7Surface.penalty > 0 && l7.source === 'estimated') {
     l7.score = Math.max(0, l7.score - l7Surface.penalty);
     l7.l7SurfacePenalty = l7Surface;
@@ -651,7 +698,7 @@ function calculateOPI({
     assetCount: filteredAssets.length,
     excludedAssetCount: assets.length - filteredAssets.length,
     hardeningPotential: hp,
-    version: '1.4.0',
+    version: '1.5.0',
   };
 }
 
