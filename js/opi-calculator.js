@@ -4,6 +4,28 @@
  * Implements the OPI v1.4.0 specification for measuring DDoS resilience.
  * See: https://github.com/ddactic/opi-calculator
  *
+ * Changelog v1.6.1:
+ *  - CDN mesh topology (Section 4.2.7): anycast CDNs are not uniform. Full-mesh
+ *    networks (Cloudflare, Fastly, Akamai, CloudFront, Google) run a globally
+ *    consistent real-time state layer, so rate-limit counters and behavioral
+ *    intelligence converge across all PoPs in near real time. Regional/semi-mesh
+ *    networks (Bunny, CDN77, StackPath, GCore, Stormwall, Voxility) reconcile
+ *    state across regional clusters asynchronously, which widens the window for
+ *    behavioral-evasion and per-PoP rate-limit bypass. MESH_TOPOLOGY tags each
+ *    anycast vendor; regional mesh takes a small behavioral/evasion penalty.
+ *    (The rate-limit-counting side of this effect was already modeled in
+ *    RL_COUNTING_ARCH_PENALTY since v1.5.0; this closes the behavioral side.)
+ *
+ * Changelog v1.6.0:
+ *  - ARCH_PROFILES replaces flat SCRUBBING_QUALITY vendor lookup for L3/L4 scoring.
+ *    9 architecture classes with l3l4/l7/behavioral scores + is_anycast flag.
+ *    Anycast architectures (Cloudflare, Magic Transit, Prolexic Routed) bypass the
+ *    pipeline capacity cap -- attack absorbs at PoPs, not customer uplink.
+ *  - MITIGATION_MATRIX: architecture x attack-type strength reference (4=best, 0=none).
+ *    Published as a public reference on ddactic.net/opi.
+ *  - archFromVendor() helper: maps vendor name string to architecture class.
+ *  - ONPREM_L3L4_BONUS: added architecture-class keys alongside legacy vendor_class keys.
+ *
  * Changelog v1.5.0:
  *  - Rate limit counting architecture penalty (Section 4.2.6):
  *    CDN vendors that use per-PoP/per-edge/per-server counting are bypasable via
@@ -67,7 +89,217 @@ const VENDOR_AUTOMATION_TIERS = {
   akamai: 20, prolexic: 20, f5: 20,
 };
 
-// Scrubbing center quality tiers
+// Architecture class profiles — replaces flat SCRUBBING_QUALITY vendor lookup (v1.6.0)
+// Each class has: l3l4 (volumetric capacity score), l7 (app-layer score),
+// behavioral (evasion/behavioral analysis score), is_anycast (no pipeline cap)
+const ARCH_PROFILES = {
+  // mesh: default topology for the class -- 'full' (globally consistent state layer),
+  // 'regional' (asynchronous cross-cluster reconciliation), or null (not a mesh/anycast).
+  // Per-vendor overrides live in MESH_TOPOLOGY below.
+  anycast_ddos_native:        { l3l4: 97, l7: 70, behavioral: 65, is_anycast: true,  mesh: 'full' },
+  anycast_cdn:                { l3l4: 88, l7: 80, behavioral: 60, is_anycast: true,  mesh: 'full' },
+  cloud_scrubbing_behavioral: { l3l4: 90, l7: 80, behavioral: 92, is_anycast: false, mesh: null },
+  cloud_scrubbing_standard:   { l3l4: 65, l7: 35, behavioral: 30, is_anycast: false, mesh: null },
+  cloud_waf_l7:               { l3l4: 5,  l7: 88, behavioral: 70, is_anycast: false, mesh: null },
+  onprem_asic_behavioral:     { l3l4: 85, l7: 75, behavioral: 80, is_anycast: false, mesh: null },
+  onprem_fpga:                { l3l4: 88, l7: 20, behavioral: 20, is_anycast: false, mesh: null },
+  onprem_ddos_software:       { l3l4: 55, l7: 70, behavioral: 55, is_anycast: false, mesh: null },
+  ngfw_dospolicy:             { l3l4: 10, l7: 25, behavioral: 10, is_anycast: false, mesh: null },
+};
+
+// CDN mesh topology per vendor (v1.6.1). Only anycast CDNs/scrubbers are listed.
+// 'full'     = globally consistent real-time state layer; rate-limit counters and
+//              behavioral signals converge across all PoPs in near real time.
+// 'regional' = regional clusters reconcile state asynchronously; wider window for
+//              behavioral-evasion and per-PoP rate-limit bypass. Smaller networks
+//              that lack a global state plane default here.
+// A vendor not listed inherits its architecture class's default `mesh`.
+const MESH_TOPOLOGY = {
+  'cloudflare': 'full',
+  'fastly':     'full',
+  'akamai':     'full',
+  'cloudfront': 'full',
+  'aws shield': 'full',
+  'google':     'full',
+  'gcp':        'full',
+  'magic transit':   'full',
+  'prolexic':        'full',
+  'spectrum':        'full',
+  'bunny':      'regional',
+  'cdn77':      'regional',
+  'stackpath':  'regional',
+  'gcore':      'regional',
+  'stormwall':  'regional',
+  'voxility':   'regional',
+};
+
+// Behavioral/evasion penalty applied when the detected anycast CDN is regional mesh.
+// "Slightly lower" -- asynchronous cross-cluster reconciliation, not an absence of
+// behavioral analysis. Full mesh = 0.
+const MESH_BEHAVIORAL_PENALTY = { full: 0, regional: 8 };
+
+/**
+ * Resolve the mesh topology of a vendor string.
+ * @param {string} vendorName - raw vendor/product name
+ * @returns {string|null} 'full' | 'regional' | null (not an anycast mesh vendor)
+ */
+function meshTopologyOf(vendorName) {
+  if (!vendorName) return null;
+  const v = vendorName.toLowerCase();
+  for (const [key, mesh] of Object.entries(MESH_TOPOLOGY)) {
+    if (v.includes(key)) return mesh;
+  }
+  // Fall back to the arch-class default for anycast vendors not explicitly tagged.
+  const cls = archFromVendor(v, false);
+  return cls && ARCH_PROFILES[cls] ? ARCH_PROFILES[cls].mesh : null;
+}
+
+// Vendor name -> architecture class (cloud/scrubbing context)
+const CLOUD_ARCH_FP = {
+  'magic transit':   'anycast_ddos_native',
+  'prolexic routed': 'anycast_ddos_native',
+  'prolexic':        'anycast_ddos_native',   // Akamai Prolexic Routed (BGP L3/L4)
+  'spectrum':        'anycast_ddos_native',   // Cloudflare Spectrum
+  'cloudflare':      'anycast_cdn',
+  'cloudfront':      'anycast_cdn',
+  'aws shield':      'anycast_cdn',
+  'azure ddos':      'anycast_cdn',
+  'akamai':          'anycast_cdn',
+  'google':          'anycast_cdn',
+  'gcp':             'anycast_cdn',
+  'fastly':          'anycast_cdn',
+  'bunny':           'anycast_cdn',
+  'cdn77':           'anycast_cdn',
+  'stackpath':       'anycast_cdn',
+  'radware nsd':     'cloud_scrubbing_behavioral',
+  'defensepro':      'cloud_scrubbing_behavioral',
+  'silverline':      'cloud_scrubbing_behavioral', // F5 Silverline managed
+  'qrator':          'cloud_scrubbing_behavioral',
+  'link11':          'cloud_scrubbing_behavioral',
+  'arbor':           'cloud_scrubbing_standard',
+  'netscout':        'cloud_scrubbing_standard',
+  'neustar':         'cloud_scrubbing_standard',
+  'vercara':         'cloud_scrubbing_standard',
+  'lumen':           'cloud_scrubbing_standard',
+  'alibaba':         'cloud_scrubbing_standard',
+  'anti-ddos':       'cloud_scrubbing_standard', // Alibaba/Huawei cloud anti-ddos
+  'tencent':         'cloud_scrubbing_standard',
+  'dayu':            'cloud_scrubbing_standard',
+  'nexusguard':      'cloud_scrubbing_standard',
+  'gcore':           'cloud_scrubbing_standard',
+  'stormwall':       'cloud_scrubbing_standard',
+  'voxility':        'cloud_scrubbing_standard',
+  'imperva':         'cloud_waf_l7',
+  'incapsula':       'cloud_waf_l7',
+  'barracuda':       'cloud_waf_l7',
+};
+
+// Vendor name -> architecture class (on-prem appliance context)
+const ONPREM_ARCH_FP = {
+  'defensepro':    'onprem_asic_behavioral',
+  'a10':           'onprem_asic_behavioral',
+  'fortiddos':     'onprem_asic_behavioral',
+  'nsfocus':       'onprem_asic_behavioral',
+  'huawei':        'onprem_asic_behavioral',   // AntiDDoS8000 series
+  'ddos protector':'onprem_asic_behavioral',   // Check Point DDoS Protector = rebadged Radware DefensePro
+  'corero':        'onprem_fpga',
+  'smartwall':     'onprem_fpga',
+  'arbor aps':     'onprem_ddos_software',
+  'f5':            'onprem_ddos_software',
+  'big-ip':        'onprem_ddos_software',
+  'palo alto':     'ngfw_dospolicy',
+  'fortigate':     'ngfw_dospolicy',
+  'checkpoint':    'ngfw_dospolicy',
+  'firepower':     'ngfw_dospolicy',           // Cisco Firepower DoS
+  'srx':           'ngfw_dospolicy',           // Juniper SRX
+};
+
+/**
+ * Map a vendor name string to an architecture class.
+ * @param {string} vendorName - Lowercased vendor/product name
+ * @param {boolean} isOnPrem - true = on-prem appliance context, false = cloud/scrubbing context
+ * @returns {string|null} architecture class key, or null if unrecognized
+ */
+function archFromVendor(vendorName, isOnPrem) {
+  if (!vendorName) return null;
+  const v = vendorName.toLowerCase();
+  const fp = isOnPrem ? ONPREM_ARCH_FP : CLOUD_ARCH_FP;
+  for (const [key, cls] of Object.entries(fp)) {
+    if (v.includes(key)) return cls;
+  }
+  return null;
+}
+
+// Mitigation strength matrix: architecture x attack type
+// 4=best, 3=strong, 2=moderate, 1=weak, 0=none
+// Note: onprem scores assume sufficient upstream link capacity
+const MITIGATION_MATRIX = {
+  anycast_ddos_native: {
+    label: 'Anycast DDoS-Native (Magic Transit, Prolexic Routed)',
+    volumetric_l3l4: 4, amplification: 4, protocol_abuse: 3,
+    l7_application: 2, behavioral_evasion: 2, slow_rate: 2,
+    detection: 'passive',
+    limitation: 'L7 behavioral analysis limited -- needs additional WAF layer for app-layer attacks mimicking legitimate traffic.',
+  },
+  anycast_cdn: {
+    label: 'Anycast CDN (Cloudflare CDN, CloudFront, Akamai, GCP)',
+    volumetric_l3l4: 3, amplification: 3, protocol_abuse: 3,
+    l7_application: 3, behavioral_evasion: 2, slow_rate: 2,
+    detection: 'passive',
+    limitation: 'CDN-oriented -- L3/L4 is absorbed but primary design is caching/L7. Behavioral analysis limited.',
+  },
+  cloud_scrubbing_behavioral: {
+    label: 'Cloud Scrubbing Behavioral (Radware NSD / DefensePro at PoPs)',
+    volumetric_l3l4: 3, amplification: 3, protocol_abuse: 3,
+    l7_application: 3, behavioral_evasion: 4, slow_rate: 3,
+    detection: 'passive',
+    limitation: 'BGP divert = single PoP bottleneck under extreme volume. Activation time ~3-5 min on-demand.',
+  },
+  cloud_scrubbing_standard: {
+    label: 'Cloud Scrubbing Standard (Arbor TMS / ISP white-label)',
+    volumetric_l3l4: 3, amplification: 3, protocol_abuse: 3,
+    l7_application: 1, behavioral_evasion: 1, slow_rate: 1,
+    detection: 'passive (ISP ASN) or questionnaire',
+    limitation: 'Signature-based. L7 application-layer attacks, behavioral evasion, and slow-rate attacks bypass it entirely.',
+  },
+  cloud_waf_l7: {
+    label: 'Cloud WAF L7 Only (Imperva, Radware Cloud WAF, Barracuda)',
+    volumetric_l3l4: 0, amplification: 0, protocol_abuse: 0,
+    l7_application: 4, behavioral_evasion: 3, slow_rate: 3,
+    detection: 'passive (ASN / challenge page)',
+    limitation: 'No L3/L4 volumetric capacity -- a large enough flood bypasses WAF inspection entirely. Must be combined with upstream scrubbing.',
+  },
+  onprem_asic_behavioral: {
+    label: 'On-Prem ASIC Behavioral (DefensePro X, A10 Thunder TPS)',
+    volumetric_l3l4: 3, amplification: 3, protocol_abuse: 3,
+    l7_application: 3, behavioral_evasion: 3, slow_rate: 2,
+    detection: 'questionnaire / vendor integration',
+    limitation: 'Capacity capped by upstream link. Cannot absorb attacks larger than the physical uplink.',
+  },
+  onprem_fpga: {
+    label: 'On-Prem FPGA Wire-Rate (Corero SmartWall TDD)',
+    volumetric_l3l4: 4, amplification: 4, protocol_abuse: 3,
+    l7_application: 1, behavioral_evasion: 1, slow_rate: 1,
+    detection: 'questionnaire / vendor integration',
+    limitation: 'Line-rate packet drops with <1ms latency. Minimal behavioral analysis -- cannot detect slow-rate or L7 evasion attacks.',
+  },
+  onprem_ddos_software: {
+    label: 'On-Prem DDoS Software (Arbor APS, F5 BIG-IP AFM)',
+    volumetric_l3l4: 2, amplification: 2, protocol_abuse: 3,
+    l7_application: 3, behavioral_evasion: 2, slow_rate: 2,
+    detection: 'questionnaire / vendor integration',
+    limitation: 'CPU-bound -- may not handle full line-rate on large links. F5 BIG-IP AFM adds TLS inspection. Arbor APS adds ATLAS intelligence.',
+  },
+  ngfw_dospolicy: {
+    label: 'NGFW DoS Policy (Palo Alto, FortiGate, Check Point)',
+    volumetric_l3l4: 0, amplification: 0, protocol_abuse: 1,
+    l7_application: 1, behavioral_evasion: 0, slow_rate: 1,
+    detection: 'questionnaire',
+    limitation: 'Not designed for DDoS -- stateful connection table exhausts under volumetric attack, crashing the firewall. Connection-rate limiting only.',
+  },
+};
+
+// Scrubbing center quality tiers (deprecated v1.6.0 -- use ARCH_PROFILES + archFromVendor() instead)
 const SCRUBBING_QUALITY = {
   cloudflare: 95, radware: 90, aws: 85, shield: 85,
   imperva: 75, incapsula: 75, neustar: 72, vercara: 72,
@@ -101,11 +333,17 @@ const VENDOR_CLASS_WAF_CREDITS = {
   unknown: 0.4,
 };
 
-// On-prem L3/L4 bonus by vendor_class
+// On-prem L3/L4 bonus by vendor_class (legacy keys) and architecture class (v1.6.0)
 const ONPREM_L3L4_BONUS = {
+  // Legacy vendor_class keys
   ddos_appliance: 45,
   security_waf: 15,
   load_balancer: 20,
+  // Architecture class keys (v1.6.0)
+  onprem_asic_behavioral: 45,
+  onprem_fpga: 45,
+  onprem_ddos_software: 30,
+  ngfw_dospolicy: 8,
 };
 
 // Scaling architecture scores
@@ -396,12 +634,22 @@ function l3l4ResilienceScore({
   onPremVendorClass = null, hasOnPremAppliance = false,
 } = {}) {
   const cov = Math.max(0, Math.min(1, cdnCoverage));
-  let hasScrubbing = false, scrubbingQuality = 0;
+  let hasScrubbing = false, scrubbingQuality = 0, isAnycast = false;
 
   if (scrubbingVendor) {
-    const sv = scrubbingVendor.toLowerCase();
-    for (const [vendor, quality] of Object.entries(SCRUBBING_QUALITY)) {
-      if (sv.includes(vendor)) { hasScrubbing = true; scrubbingQuality = Math.max(scrubbingQuality, quality); }
+    // v1.6.0: resolve vendor name to architecture class first
+    const archClass = archFromVendor(scrubbingVendor, false);
+    const profile = archClass ? ARCH_PROFILES[archClass] : null;
+    if (profile) {
+      hasScrubbing = true;
+      scrubbingQuality = profile.l3l4;
+      isAnycast = profile.is_anycast;
+    } else {
+      // Fallback: legacy SCRUBBING_QUALITY substring match
+      const sv = scrubbingVendor.toLowerCase();
+      for (const [vendor, quality] of Object.entries(SCRUBBING_QUALITY)) {
+        if (sv.includes(vendor)) { hasScrubbing = true; scrubbingQuality = Math.max(scrubbingQuality, quality); }
+      }
     }
   }
 
@@ -418,7 +666,7 @@ function l3l4ResilienceScore({
   const ispScore = ispTier ? (ispScores[ispTier.toLowerCase()] || 0) : 0;
   const ispKnown = ispScore > 0;
 
-  // On-prem L3/L4 bonus by vendor_class
+  // On-prem L3/L4 bonus: check architecture class first, then legacy vendor_class
   let onpremBonus = 0;
   if (onPremVendorClass) {
     onpremBonus = ONPREM_L3L4_BONUS[onPremVendorClass] || 0;
@@ -431,7 +679,8 @@ function l3l4ResilienceScore({
     if (ispKnown) base = Math.min(100, base + Math.round(ispScore * 0.2));
     // On-prem appliance stacks with cloud scrubbing: add 10%
     if (onpremBonus > 0) base = Math.min(100, base + Math.round(onpremBonus * 0.1));
-    if (pipelineBase !== null && pipelineBase < base) base = Math.round((base + pipelineBase) / 2);
+    // Anycast architectures absorb at distributed PoPs -- customer uplink capacity does NOT cap score
+    if (!isAnycast && pipelineBase !== null && pipelineBase < base) base = Math.round((base + pipelineBase) / 2);
   } else if (hasOnPremAppliance && onpremBonus > 0) {
     // No cloud scrubbing, but on-prem appliance provides inline protection.
     // Limited by upstream link capacity.
@@ -450,7 +699,7 @@ function l3l4ResilienceScore({
 
   base = Math.max(20, base);
   const score = hasCdn ? Math.round(base * cov + 20 * (1 - cov)) : base;
-  return { score, source: 'estimated', hasScrubbing, scrubbingQuality, onpremL3l4Bonus: onpremBonus };
+  return { score, source: 'estimated', hasScrubbing, scrubbingQuality, isAnycast, onpremL3l4Bonus: onpremBonus };
 }
 
 function protocolResilienceScore({ cdnQuality = 'none', cdnCoverage = 0, hasCdn = false } = {}) {
@@ -557,10 +806,24 @@ function evasionResistanceScore({ cdnQuality = 'none', cdnCoverage = 0, hasCdn =
   }
   const avgDepth = depths.length > 0 ? Math.round(depths.reduce((s, d) => s + d, 0) / depths.length) : 30;
 
+  // v1.6.1: regional/semi-mesh anycast CDNs reconcile behavioral state across
+  // clusters asynchronously, widening the evasion window. Resolve the mesh
+  // topology of the detected CDN/scrubbing vendor and apply a small penalty.
+  let meshPenalty = 0, meshTopo = null;
+  if (hasCdn) {
+    for (const a of (assets || [])) {
+      const vendor = a.cdnProvider || a.cdn_provider || a.scrubbing || a.vendor || '';
+      const topo = meshTopologyOf(vendor);
+      if (topo) { meshTopo = topo; meshPenalty = MESH_BEHAVIORAL_PENALTY[topo] || 0; }
+      if (topo === 'regional') break; // regional dominates if any protected asset is on a semi-mesh CDN
+    }
+  }
+
   let score;
   if (hasCdn) score = Math.round(avgDepth * cov + 10 * (1 - cov));
   else score = Math.min(avgDepth, 30);
-  return { score, source: 'estimated' };
+  score = Math.max(0, score - (hasCdn ? meshPenalty : 0));
+  return { score, source: 'estimated', meshTopology: meshTopo, meshPenalty };
 }
 
 /**
@@ -698,7 +961,7 @@ function calculateOPI({
     assetCount: filteredAssets.length,
     excludedAssetCount: assets.length - filteredAssets.length,
     hardeningPotential: hp,
-    version: '1.5.0',
+    version: '1.6.1',
   };
 }
 
@@ -717,8 +980,11 @@ if (typeof module !== 'undefined' && module.exports) {
     calculateOPI, defenseCoverageScore, l7ResilienceScore, l7AttackSurfacePenalty,
     l3l4ResilienceScore, protocolResilienceScore, operationalResilienceScore,
     evasionResistanceScore, gradeFromScore, normalizedOPI, hardeningPotential,
+    archFromVendor, meshTopologyOf,
     WEIGHTS, GRADE_SCALE, VENDOR_AUTOMATION_TIERS, SCRUBBING_QUALITY,
     VENDOR_CLASS_WAF_CREDITS, ONPREM_L3L4_BONUS, SCALING_SCORES,
+    ARCH_PROFILES, CLOUD_ARCH_FP, ONPREM_ARCH_FP, MITIGATION_MATRIX,
+    MESH_TOPOLOGY, MESH_BEHAVIORAL_PENALTY,
   };
 }
 
@@ -726,6 +992,8 @@ if (typeof module !== 'undefined' && module.exports) {
 if (typeof globalThis !== 'undefined') {
   globalThis.OPICalculator = {
     calculateOPI, defenseCoverageScore, gradeFromScore, normalizedOPI, hardeningPotential,
-    WEIGHTS, GRADE_SCALE,
+    archFromVendor, meshTopologyOf,
+    WEIGHTS, GRADE_SCALE, ARCH_PROFILES, MITIGATION_MATRIX,
+    MESH_TOPOLOGY, MESH_BEHAVIORAL_PENALTY,
   };
 }
